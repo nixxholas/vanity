@@ -1,3 +1,5 @@
+#ifdef CUDA_GPU
+
 #include <stdio.h>
 #include "base58.h"
 #include "vanity.h"
@@ -237,3 +239,5 @@ __device__ bool matches_target(unsigned char *a, unsigned char *target, uint64_t
     }
     return true;
 }
+
+#endif // CUDA_GPU
