@@ -8,10 +8,12 @@ authors = [
 ]
 license = "MIT OR Apache-2.0"
 description = "A *bLaZinGlY fAsT* tool for grinding vanity addresses on Solana"
+build = "build.rs"
 
 [features]
-gpu = ["cc"]
 default = []
+cuda-gpu = ["cc"]
+apple-gpu = ["metal"]
 
 [profile.release]
 lto = "fat"
@@ -26,6 +28,7 @@ num-format = "0.4.4"
 rand = "0.8.5"
 rayon = "1.10.0"
 sha2 = "0.10.8"
+metal = { version = "0.30.0", features = ["mps"], optional = true }
 
 [build-dependencies]
 cc = { version = "1.0.98", optional = true }
