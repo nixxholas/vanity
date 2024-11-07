@@ -11,6 +11,9 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "apple-gpu")]
+use vanity::GpuVanitySearch;
+
 #[derive(Debug, Parser)]
 pub struct Args {
     /// The pubkey that will be the signer for the CreateAccountWithSeed instruction
@@ -35,7 +38,7 @@ pub struct Args {
 
     /// Number of gpus to use for mining
     #[clap(long, default_value_t = 1)]
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
     pub num_gpus: u32,
 
     /// Number of cpu threads to use for mining
@@ -68,10 +71,10 @@ fn main() {
 
     // Print resource usage
     logfather::info!("using {} threads", args.num_cpus);
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
     logfather::info!("using {} gpus", args.num_gpus);
 
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
     let _gpu_threads: Vec<_> = (0..args.num_gpus)
         .map(move |gpu_index| {
             std::thread::Builder::new()
@@ -90,9 +93,42 @@ fn main() {
                         // Generate new seed for this gpu & iteration
                         let seed = new_gpu_seed(gpu_index, iteration);
                         let timer = Instant::now();
+
+                        #[cfg(feature = "cuda-gpu")]
                         unsafe {
-                            vanity_round(gpu_index, seed.as_ref().as_ptr(), args.base.as_ptr(), args.owner.as_ptr(), target.as_ptr(), target.len() as u64, out.as_mut_ptr(), args.case_insensitive);
+                            vanity_round(
+                                gpu_index,
+                                seed.as_ref().as_ptr(),
+                                args.base.as_ptr(),
+                                args.owner.as_ptr(),
+                                target.as_ptr(),
+                                target.len() as u64,
+                                out.as_mut_ptr(),
+                                args.case_insensitive,
+                            );
                         }
+
+                        #[cfg(feature = "apple-gpu")]
+                        {
+                            let gpu = GpuVanitySearch::new();
+                            match gpu.vanity_round(
+                                gpu_index as i32,
+                                &seed,
+                                &args.base,
+                                &args.owner,
+                                target,
+                                args.case_insensitive,
+                            ) {
+                                Ok(result) => {
+                                    out.copy_from_slice(&result[..24]);
+                                }
+                                Err(e) => {
+                                    logfather::error!("GPU error: {}", e);
+                                    continue;
+                                }
+                            }
+                        }
+
                         let time_sec = timer.elapsed().as_secs_f64();
 
                         // Reconstruct solution
@@ -103,7 +139,8 @@ fn main() {
                             .finalize()
                             .into();
                         let out_str = fd_bs58::encode_32(reconstructed);
-                        let out_str_target_check = maybe_bs58_aware_lowercase(&out_str, args.case_insensitive);
+                        let out_str_target_check =
+                            maybe_bs58_aware_lowercase(&out_str, args.case_insensitive);
                         let count = u64::from_le_bytes(array::from_fn(|i| out[16 + i]));
                         logfather::info!(
                             "{}.. found in {:.3} seconds on gpu {gpu_index:>3}; {:>13} iters; {:>12} iters/sec",
@@ -208,6 +245,7 @@ fn maybe_bs58_aware_lowercase(target: &str, case_insensitive: bool) -> String {
     }
 }
 
+#[cfg(feature = "cuda-gpu")]
 extern "C" {
     pub fn vanity_round(
         gpus: u32,
@@ -221,7 +259,7 @@ extern "C" {
     );
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
 fn new_gpu_seed(gpu_id: u32, iteration: u64) -> [u8; 32] {
     Sha256::new()
         .chain_update(rand::random::<[u8; 32]>())
