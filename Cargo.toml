@@ -21,8 +21,12 @@ codegen-units = 1
 
 
 [dependencies]
+bs58 = "0.5.1"
 clap = { version = "4.5.7", features = ["derive"] }
+ctrlc = "3.2"
 fd_bs58 = "0.1.0"
+indicatif = "0.17.0"
+lazy_static = "1.4.0"
 logfather = "0.2.6"
 num-format = "0.4.4"
 rand = "0.8.5"

@@ -203,10 +203,19 @@ void base58_encode_32(thread const uint8_t* input, thread uint8_t* output, bool 
     }
 }
 
+inline char to_lowercase(char c) {
+    return (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+}
+
 bool matches_target(thread const uint8_t* a, constant char* target, uint64_t n) {
     for (uint64_t i = 0; i < n; i++) {
-        if (a[i] != target[i])
-            return false;
+        if (d_case_insensitive) {
+            char a_char = to_lowercase(a[i]);
+            char t_char = to_lowercase(target[i]);
+            if (a_char != t_char) return false;
+        } else {
+            if (a[i] != target[i]) return false;
+        }
     }
     return true;
 }
@@ -220,10 +229,13 @@ kernel void vanity_search(
     device uint8_t* out [[buffer(5)]],
     device atomic_int* done [[buffer(6)]],
     device atomic_uint* count [[buffer(7)]],
-    uint thread_position_in_grid [[thread_position_in_grid]],
-    uint threads_per_grid [[threads_per_grid]]
+    uint threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint threads_per_threadgroup [[threads_per_threadgroup]],
+    uint thread_position_in_threadgroup [[thread_position_in_threadgroup]]
 ) {
-    uint64_t idx = thread_position_in_grid;
+    // Calculate global thread ID more efficiently
+    uint64_t idx = (threadgroup_position_in_grid * threads_per_threadgroup) + thread_position_in_threadgroup;
+    
     thread uint8_t local_out[32] = {0};
     thread uint8_t local_encoded[44] = {0};
     thread uint64_t local_seed[4];
@@ -242,8 +254,12 @@ kernel void vanity_search(
     sha256_init(address_sha);
     sha256_update_constant(address_sha, base, 32);
 
-    for (uint64_t iter = 0; iter < 1000 * 1000 * 1000; iter++) {
-        if (iter % 100 == 0) {
+    // Add max iterations as a constant or parameter
+    const uint64_t MAX_ITERATIONS = 1000 * 1000 * 1000;
+    
+    for (uint64_t iter = 0; iter < MAX_ITERATIONS; iter++) {
+        // Reduce atomic checks frequency
+        if (iter % 100 == 0) {  // Check less frequently
             if (atomic_load_explicit(done, memory_order_relaxed) == 1) {
                 atomic_fetch_add_explicit(count, iter, memory_order_relaxed);
                 return;
@@ -290,5 +306,14 @@ kernel void vanity_search(
             atomic_fetch_add_explicit(count, iter + 1, memory_order_relaxed);
             return;
         }
+    }
+
+    // Add explicit termination if max iterations reached
+    atomic_fetch_add_explicit(count, MAX_ITERATIONS, memory_order_relaxed);
+
+    // Add bounds checking
+    if (target_len > 44) {
+        atomic_store_explicit(done, 1, memory_order_relaxed);
+        return;
     }
 } 

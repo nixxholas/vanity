@@ -4,6 +4,7 @@ use num_format::{Locale, ToFormattedString};
 use rand::{distributions::Alphanumeric, Rng};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use sha2::{Digest, Sha256};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use std::{
     array,
@@ -111,6 +112,11 @@ fn main() {
                         #[cfg(feature = "apple-gpu")]
                         {
                             let gpu = GpuVanitySearch::new();
+                            let pb = ProgressBar::new_spinner();
+                            pb.set_style(ProgressStyle::default_spinner()
+                                .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                                .unwrap());
+
                             match gpu.vanity_round(
                                 gpu_index as i32,
                                 &seed,
@@ -121,9 +127,17 @@ fn main() {
                             ) {
                                 Ok(result) => {
                                     out.copy_from_slice(&result[..24]);
+                                    let address = bs58::encode(&out).into_string();
+                                    pb.set_message(format!("Found address: {}", address));
+                                    pb.finish_with_message(format!("✨ Found matching address: {}", address));
                                 }
                                 Err(e) => {
                                     logfather::error!("GPU error: {}", e);
+                                    if e.to_string().contains("interrupted") {
+                                        EXIT.store(true, Ordering::SeqCst);
+                                        pb.finish_and_clear();
+                                        return;
+                                    }
                                     continue;
                                 }
                             }
