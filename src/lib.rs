@@ -1,4 +1,4 @@
 pub mod gpu;
+pub mod benchmark;
 
-// Re-export GpuVanitySearch for convenience
-pub use gpu::GpuVanitySearch; 
+pub use gpu::GpuVanitySearch;

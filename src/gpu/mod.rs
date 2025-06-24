@@ -23,4 +23,21 @@ impl GpuVanitySearch {
         #[cfg(not(feature = "apple-gpu"))]
         Err("No GPU implementation available".into())
     }
+    
+    pub fn vanity_round_with_timeout(
+        &self,
+        id: i32,
+        seed: &[u8],
+        base: &[u8],
+        owner: &[u8],
+        target: &str,
+        case_insensitive: bool,
+        timeout_secs: u64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        #[cfg(feature = "apple-gpu")]
+        return metal::vanity_round_with_timeout(id, seed, base, owner, target, case_insensitive, timeout_secs);
+
+        #[cfg(not(feature = "apple-gpu"))]
+        Err("No GPU implementation available".into())
+    }
 } 

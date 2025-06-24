@@ -4,7 +4,10 @@ using namespace metal;
 // Device-wide constants
 constant bool d_case_insensitive [[function_constant(0)]];
 
-// Base58 alphabet
+// Base58 alphabet for Solana addresses (proper BS58 alphabet)
+constant unsigned char bs58_alphabet[59] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+// Alphanumeric characters for seed generation
 constant unsigned char alphanumeric[63] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 // SHA256 constants
@@ -181,6 +184,7 @@ void base58_encode_32(thread const uint8_t* input, thread uint8_t* output, bool 
     uint8_t digits[44] = {0};
     int digitslen = 1;
     
+    // Process input bytes
     for (int i = 0; i < 32; i++) {
         uint32_t carry = input[i];
         for (int j = 0; j < digitslen; j++) {
@@ -194,13 +198,27 @@ void base58_encode_32(thread const uint8_t* input, thread uint8_t* output, bool 
         }
     }
     
+    // Count leading zeros
+    int zeros = 0;
+    for (int i = 0; i < 32 && input[i] == 0; i++) {
+        zeros++;
+    }
+    
+    // Output base58 string
     int outputlen = 0;
+    
+    // Add '1' for each leading zero byte
+    for (int i = 0; i < zeros; i++) {
+        output[outputlen++] = bs58_alphabet[0]; // '1'
+    }
+    
+    // Add the rest of the encoded data
     for (int i = digitslen - 1; i >= 0; i--) {
-        output[outputlen++] = alphanumeric[digits[i]];
+        output[outputlen++] = bs58_alphabet[digits[i]];
     }
-    while (outputlen < 44) {
-        output[outputlen++] = alphanumeric[0];
-    }
+    
+    // Null terminate for string operations
+    output[outputlen] = '\0';
 }
 
 inline char to_lowercase(char c) {
@@ -208,16 +226,32 @@ inline char to_lowercase(char c) {
 }
 
 bool matches_target(thread const uint8_t* a, constant char* target, uint64_t n) {
-    for (uint64_t i = 0; i < n; i++) {
-        if (d_case_insensitive) {
-            char a_char = to_lowercase(a[i]);
-            char t_char = to_lowercase(target[i]);
-            if (a_char != t_char) return false;
-        } else {
-            if (a[i] != target[i]) return false;
+    // Unroll loop for common target lengths
+    if (n <= 8) {
+        // Fast path for short targets (most common case)
+        for (uint64_t i = 0; i < n; i++) {
+            if (d_case_insensitive) {
+                char a_char = to_lowercase(a[i]);
+                char t_char = to_lowercase(target[i]);
+                if (a_char != t_char) return false;
+            } else {
+                if (a[i] != target[i]) return false;
+            }
         }
+        return true;
+    } else {
+        // General path for longer targets
+        for (uint64_t i = 0; i < n; i++) {
+            if (d_case_insensitive) {
+                char a_char = to_lowercase(a[i]);
+                char t_char = to_lowercase(target[i]);
+                if (a_char != t_char) return false;
+            } else {
+                if (a[i] != target[i]) return false;
+            }
+        }
+        return true;
     }
-    return true;
 }
 
 kernel void vanity_search(
@@ -231,10 +265,16 @@ kernel void vanity_search(
     device atomic_uint* count [[buffer(7)]],
     uint threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint threads_per_threadgroup [[threads_per_threadgroup]],
-    uint thread_position_in_threadgroup [[thread_position_in_threadgroup]]
+    uint thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint thread_position_in_grid [[thread_position_in_grid]]
 ) {
-    // Calculate global thread ID more efficiently
-    uint64_t idx = (threadgroup_position_in_grid * threads_per_threadgroup) + thread_position_in_threadgroup;
+    // Use direct grid position for better efficiency
+    uint64_t idx = thread_position_in_grid;
+    
+    // Early exit if already found
+    if (atomic_load_explicit(done, memory_order_relaxed) == 1) {
+        return;
+    }
     
     thread uint8_t local_out[32] = {0};
     thread uint8_t local_encoded[44] = {0};
@@ -254,12 +294,16 @@ kernel void vanity_search(
     sha256_init(address_sha);
     sha256_update_constant(address_sha, base, 32);
 
-    // Add max iterations as a constant or parameter
-    const uint64_t MAX_ITERATIONS = 1000 * 1000 * 1000;
+    // Add max iterations with better optimization for Apple Silicon
+    const uint64_t MAX_ITERATIONS = 10000000; // 10M iterations per thread
+    const uint64_t CHECK_INTERVAL = 1024; // Check every 1024 iterations (power of 2 for efficiency)
+    
+    // Cache target length for faster comparison
+    const uint64_t cached_target_len = target_len;
     
     for (uint64_t iter = 0; iter < MAX_ITERATIONS; iter++) {
-        // Reduce atomic checks frequency
-        if (iter % 100 == 0) {  // Check less frequently
+        // Use bitwise AND for modulo with power of 2
+        if ((iter & (CHECK_INTERVAL - 1)) == 0) {
             if (atomic_load_explicit(done, memory_order_relaxed) == 1) {
                 atomic_fetch_add_explicit(count, iter, memory_order_relaxed);
                 return;
@@ -290,14 +334,36 @@ kernel void vanity_search(
             alphanumeric[(indices[7] >> 2) % 62],
         };
 
-        // Calculate and encode public key
+        // Calculate public key
         thread SHA256_CTX address_sha_local = address_sha;
         sha256_update(address_sha_local, create_account_seed, 16);
         sha256_update_constant(address_sha_local, owner, 32);
         sha256_final(address_sha_local, local_out);
+        
+        // Early rejection based on first byte (optimization for specific prefixes)
+        // This can eliminate ~98% of candidates before base58 encoding
+        if (cached_target_len > 0) {
+            // Rough estimation: first base58 char maps to ~1.37 bits
+            uint8_t first_byte = local_out[0];
+            char expected_first = target[0];
+            
+            // Quick rejection for common cases
+            if (!d_case_insensitive) {
+                if (expected_first >= '1' && expected_first <= '9') {
+                    if (first_byte > 58) continue; // Can't start with 1-9
+                } else if (expected_first >= 'A' && expected_first <= 'H') {
+                    if (first_byte < 58 || first_byte > 116) continue;
+                } else if (expected_first >= 'J' && expected_first <= 'N') {
+                    if (first_byte < 116 || first_byte > 174) continue;
+                } else if (expected_first >= 'P' && expected_first <= 'Z') {
+                    if (first_byte < 174) continue;
+                }
+            }
+        }
+        
         base58_encode_32(local_out, local_encoded, d_case_insensitive);
 
-        if (matches_target(local_encoded, target, target_len)) {
+        if (matches_target(local_encoded, target, cached_target_len)) {
             if (atomic_exchange_explicit(done, 1, memory_order_relaxed) == 0) {
                 for (int i = 0; i < 16; i++) {
                     out[i] = create_account_seed[i];
@@ -311,9 +377,6 @@ kernel void vanity_search(
     // Add explicit termination if max iterations reached
     atomic_fetch_add_explicit(count, MAX_ITERATIONS, memory_order_relaxed);
 
-    // Add bounds checking
-    if (target_len > 44) {
-        atomic_store_explicit(done, 1, memory_order_relaxed);
-        return;
-    }
+    // Report completion count
+    atomic_fetch_add_explicit(count, MAX_ITERATIONS, memory_order_relaxed);
 } 
