@@ -29,6 +29,7 @@ EXAMPLE USAGE:
 PERFORMANCE TIPS:
 • Use --case-insensitive for faster results when case doesn't matter
 • Shorter prefixes are exponentially faster to find
+• Default settings auto-detect optimal CPU and GPU worker counts
 • Apple Silicon GPUs provide significant speedup over CPU-only search")]
 pub struct Args {
     /// Base public key (32-byte Solana public key in base58 format)
@@ -67,13 +68,13 @@ pub struct Args {
     /// Number of GPU workers to use for address generation
     /// On Apple Silicon: Controls parallel GPU contexts (1-8 recommended)  
     /// On discrete GPUs: Number of physical GPU devices
-    /// Default: 1 (use 0 to disable GPU acceleration)
-    #[clap(long, default_value_t = 1)]
+    /// Default: 0 (auto-detect optimal count), use explicit number to override
+    #[clap(long, default_value_t = 0)]
     #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
     pub num_gpus: u32,
 
     /// Number of CPU threads to use for address generation
-    /// Default: 0 (auto-detect), set to 0 to use all available cores
+    /// Default: 0 (auto-detect all cores), use explicit number to override
     #[clap(long, default_value_t = 0)]
     pub num_cpus: u32,
 
@@ -89,12 +90,15 @@ fn main() {
     let args = Args::parse();
     
     if args.benchmark {
-        #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
-        let num_gpus = args.num_gpus;
-        #[cfg(not(any(feature = "cuda-gpu", feature = "apple-gpu")))]
-        let num_gpus = 0;
+        // Use auto-detection for benchmark too
+        let benchmark_cpu_count = detect_optimal_cpu_count(args.num_cpus);
         
-        benchmark::run_benchmark(args.num_cpus, num_gpus);
+        #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
+        let benchmark_gpu_count = detect_optimal_gpu_count(args.num_gpus);
+        #[cfg(not(any(feature = "cuda-gpu", feature = "apple-gpu")))]
+        let benchmark_gpu_count = 0;
+        
+        benchmark::run_benchmark(benchmark_cpu_count, benchmark_gpu_count);
         return;
     }
 
@@ -110,10 +114,30 @@ fn main() {
     logger.timestamp_format("%Y-%m-%d %H:%M:%S");
     logger.level(Level::Info);
 
-    // Print resource usage
-    logfather::info!("using {} threads", args.num_cpus);
+    // Auto-detect optimal resource counts
+    let optimal_cpu_count = detect_optimal_cpu_count(args.num_cpus);
+    
     #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
-    logfather::info!("using {} gpus", args.num_gpus);
+    let optimal_gpu_count = detect_optimal_gpu_count(args.num_gpus);
+    #[cfg(not(any(feature = "cuda-gpu", feature = "apple-gpu")))]
+    let optimal_gpu_count = 0;
+    
+    // Print resource usage with auto-detection info
+    if args.num_cpus == 0 {
+        logfather::info!("Auto-detected {} CPU threads (from {} available cores)", optimal_cpu_count, 
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+    } else {
+        logfather::info!("Using {} CPU threads (user specified)", optimal_cpu_count);
+    }
+    
+    #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
+    if optimal_gpu_count > 0 {
+        if args.num_gpus == 0 {
+            logfather::info!("Auto-detected {} GPU workers (optimized for Apple Silicon)", optimal_gpu_count);
+        } else {
+            logfather::info!("Using {} GPU workers (user specified)", optimal_gpu_count);
+        }
+    }
 
     // Hybrid CPU+GPU processing - run simultaneously for maximum performance
     let mut handles = vec![];
@@ -124,10 +148,10 @@ fn main() {
     
     // GPU processing
     #[cfg(feature = "apple-gpu")]
-    if args.num_gpus > 0 {
-        logfather::info!("Starting {} GPU workers", args.num_gpus);
+    if optimal_gpu_count > 0 {
+        logfather::info!("Starting {} GPU workers", optimal_gpu_count);
         
-        for gpu_index in 0..args.num_gpus {
+        for gpu_index in 0..optimal_gpu_count {
             let base = base;
             let owner = owner;
             let target = target.clone();
@@ -221,13 +245,10 @@ fn main() {
     }
 
     // CPU processing - runs simultaneously with GPU
-    let mut num_cpus = args.num_cpus;
-    maybe_update_num_cpus(&mut num_cpus);
-    
-    if num_cpus > 0 {
-        logfather::info!("Starting {} CPU workers", num_cpus);
+    if optimal_cpu_count > 0 {
+        logfather::info!("Starting {} CPU workers", optimal_cpu_count);
         
-        for cpu_index in 0..num_cpus {
+        for cpu_index in 0..optimal_cpu_count {
             let base = base;
             let owner = owner;
             let target = target.clone();
@@ -357,6 +378,53 @@ fn parse_pubkey(input: &str) -> Result<[u8; 32], String> {
             }
         }
         Err(e) => Err(format!("Invalid base58: {}", e))
+    }
+}
+
+fn detect_optimal_cpu_count(user_specified: u32) -> u32 {
+    if user_specified > 0 {
+        return user_specified;
+    }
+    
+    // Auto-detect optimal CPU count
+    let physical_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4) as u32;
+    
+    // For vanity search, we typically want to leave some cores for the system
+    // unless we're on a high-core-count machine
+    let optimal_cores = if physical_cores <= 4 {
+        physical_cores.saturating_sub(1).max(1) // Leave 1 core for system
+    } else if physical_cores <= 8 {
+        physical_cores.saturating_sub(2) // Leave 2 cores for system  
+    } else {
+        // High core count: use most cores but leave some headroom
+        (physical_cores * 7 / 8).max(physical_cores.saturating_sub(4))
+    };
+    
+    optimal_cores
+}
+
+#[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
+fn detect_optimal_gpu_count(user_specified: u32) -> u32 {
+    if user_specified > 0 {
+        return user_specified;
+    }
+    
+    // Auto-detect optimal GPU worker count
+    // This is platform-specific optimization
+    
+    #[cfg(target_os = "macos")]
+    {
+        // Apple Silicon optimization
+        // M1/M2/M3/M4 GPUs work best with 4-6 parallel contexts
+        4 // Conservative default that works well across all Apple Silicon variants
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        // For CUDA/other platforms, default to 1 GPU with multiple contexts
+        1
     }
 }
 
