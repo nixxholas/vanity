@@ -115,120 +115,167 @@ fn main() {
     #[cfg(any(feature = "cuda-gpu", feature = "apple-gpu"))]
     logfather::info!("using {} gpus", args.num_gpus);
 
+    // Hybrid CPU+GPU processing - run simultaneously for maximum performance
+    let mut handles = vec![];
+    
+    let base = args.base.expect("Base is required for processing");
+    let owner = args.owner.expect("Owner is required for processing");
+    let target = get_validated_target(&args);
+    
     // GPU processing
     #[cfg(feature = "apple-gpu")]
     if args.num_gpus > 0 {
-        let base = args.base.expect("Base is required for GPU processing");
-        let owner = args.owner.expect("Owner is required for GPU processing");
-        let target = get_validated_target(&args);
+        logfather::info!("Starting {} GPU workers", args.num_gpus);
         
-        (0..args.num_gpus)
-            .map(move |gpu_index| {
-                let base = base;
-                let owner = owner;
-                let target = target.clone();
-                std::thread::spawn(move || {
-                    let mut iteration = 0u64;
-                    let _out = [0u8; 32];
+        for gpu_index in 0..args.num_gpus {
+            let base = base;
+            let owner = owner;
+            let target = target.clone();
+            
+            let handle = std::thread::spawn(move || {
+                let mut iteration = 0u64;
+                let gpu = GpuVanitySearch::new();
+                
+                // Only show progress for first GPU worker to avoid spam
+                let pb = if gpu_index == 0 {
+                    let pb = ProgressBar::new_spinner();
+                    pb.set_style(ProgressStyle::default_spinner()
+                        .template("{spinner:.green} [{elapsed_precise}] GPU: {msg}")
+                        .unwrap());
+                    pb.set_message("Searching...");
+                    Some(pb)
+                } else {
+                    None
+                };
+                
+                loop {
+                    if EXIT.load(Ordering::SeqCst) {
+                        if let Some(pb) = &pb {
+                            pb.finish_and_clear();
+                        }
+                        return;
+                    }
+
+                    let seed = new_gpu_seed(gpu_index, iteration);
                     
-                    loop {
-                        if EXIT.load(Ordering::SeqCst) {
+                    match gpu.vanity_round(
+                        gpu_index as i32,
+                        &seed,
+                        &base,
+                        &owner,
+                        &target,
+                        args.case_insensitive,
+                    ) {
+                        Ok(result) => {
+                            // Extract the found seed (first 16 bytes)
+                            let found_seed = &result[..16];
+                            
+                            // Reconstruct the full public key
+                            let mut hasher = sha2::Sha256::new();
+                            hasher.update(&base);
+                            hasher.update(found_seed);
+                            hasher.update(&owner);
+                            let pubkey = hasher.finalize();
+                            
+                            let address = bs58::encode(&pubkey).into_string();
+                            
+                            if let Some(pb) = &pb {
+                                pb.finish_with_message(format!("✨ GPU found: {}", address));
+                            }
+                            
+                            logfather::info!("GPU {} found seed: {}", gpu_index, bs58::encode(found_seed).into_string());
+                            logfather::info!("Full address: {}", address);
+                            
+                            EXIT.store(true, Ordering::SeqCst);
                             return;
                         }
-
-                        let seed = new_gpu_seed(gpu_index, iteration);
-                        
-                        let gpu = GpuVanitySearch::new();
-                        let pb = ProgressBar::new_spinner();
-                        pb.set_style(ProgressStyle::default_spinner()
-                            .template("{spinner:.green} [{elapsed_precise}] {msg}")
-                            .unwrap());
-                        pb.set_message("Searching for vanity address...");
-
-                        match gpu.vanity_round(
-                            gpu_index as i32,
-                            &seed,
-                            &base,
-                            &owner,
-                            &target,
-                            args.case_insensitive,
-                        ) {
-                            Ok(result) => {
-                                // Extract the found seed (first 16 bytes)
-                                let found_seed = &result[..16];
-                                
-                                // Reconstruct the full public key
-                                let mut hasher = sha2::Sha256::new();
-                                hasher.update(&base);
-                                hasher.update(found_seed);
-                                hasher.update(&owner);
-                                let pubkey = hasher.finalize();
-                                
-                                let address = bs58::encode(&pubkey).into_string();
-                                pb.finish_with_message(format!("✨ Found matching address: {}", address));
-                                
-                                logfather::info!("Found seed: {}", bs58::encode(found_seed).into_string());
-                                logfather::info!("Full address: {}", address);
-                                
+                        Err(e) => {
+                            if e.to_string().contains("interrupted") || e.to_string().contains("timed out") {
                                 EXIT.store(true, Ordering::SeqCst);
+                                if let Some(pb) = &pb {
+                                    pb.finish_and_clear();
+                                }
                                 return;
                             }
-                            Err(e) => {
-                                if e.to_string().contains("interrupted") || e.to_string().contains("timed out") {
-                                    EXIT.store(true, Ordering::SeqCst);
-                                    pb.finish_and_clear();
-                                    return;
-                                }
-                                if !e.to_string().contains("No match found") {
+                            if !e.to_string().contains("No match found") {
+                                if let Some(pb) = &pb {
                                     pb.set_message(format!("GPU {} error: {}", gpu_index, e));
                                 }
                             }
                         }
-                        
-                        iteration += 1;
                     }
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .for_each(|handle| {
-                let _ = handle.join();
+                    
+                    iteration += 1;
+                    
+                    // Update progress occasionally for main GPU worker
+                    if gpu_index == 0 && iteration % 10 == 0 {
+                        if let Some(pb) = &pb {
+                            pb.set_message(format!("Searching... (round {})", iteration));
+                        }
+                    }
+                }
             });
+            
+            handles.push(handle);
+        }
     }
 
-    // CPU processing
+    // CPU processing - runs simultaneously with GPU
     let mut num_cpus = args.num_cpus;
     maybe_update_num_cpus(&mut num_cpus);
     
     if num_cpus > 0 {
-        let base = args.base.expect("Base is required for CPU processing");  // Copy for CPU threads  
-        let owner = args.owner.expect("Owner is required for CPU processing");  // Copy for CPU threads
-        let _target = get_validated_target(&args);
+        logfather::info!("Starting {} CPU workers", num_cpus);
         
-        (0..num_cpus).into_par_iter().for_each(|i| {
-            let base = base;  // Copy for each thread
-            let owner = owner;  // Copy for each thread
+        for cpu_index in 0..num_cpus {
+            let base = base;
+            let owner = owner;
+            let target = target.clone();
             
-            let mut iteration = 0u64;
-            let base_sha = Sha256::new().chain_update(&base);
-            
-            loop {
-                if EXIT.load(Ordering::SeqCst) {
-                    return;
-                }
+            let handle = std::thread::spawn(move || {
+                let mut iteration = 0u64;
+                let base_sha = Sha256::new().chain_update(&base);
+                
+                loop {
+                    if EXIT.load(Ordering::SeqCst) {
+                        return;
+                    }
 
-                let seed = new_cpu_seed(i, iteration);
-                let hasher = base_sha.clone();
-                
-                let _ = hasher
-                    .chain_update(&seed)
-                    .chain_update(&owner);
-                
-                // ... rest of the CPU processing code ...
-                
-                iteration += 1;
-            }
-        });
+                    let seed = new_cpu_seed(cpu_index, iteration);
+                    
+                    // Calculate the PDA
+                    let mut hasher = base_sha.clone();
+                    hasher.update(&seed);
+                    hasher.update(&owner);
+                    let pubkey = hasher.finalize();
+                    
+                    // Check if it matches target
+                    let address = bs58::encode(&pubkey).into_string();
+                    let matches = if args.case_insensitive {
+                        address.to_lowercase().starts_with(&target.to_lowercase())
+                    } else {
+                        address.starts_with(&target)
+                    };
+                    
+                    if matches {
+                        logfather::info!("CPU {} found seed: {}", cpu_index, bs58::encode(&seed).into_string());
+                        logfather::info!("Full address: {}", address);
+                        
+                        EXIT.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    
+                    iteration += 1;
+                }
+            });
+            
+            handles.push(handle);
+        }
+    }
+    
+    // Wait for any worker (CPU or GPU) to find a result
+    for handle in handles {
+        let _ = handle.join();
     }
 }
 
